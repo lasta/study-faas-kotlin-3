@@ -35,7 +35,7 @@ GraalVM 向けはベータリリース段階であり、 Multiplatform 向け (J
   * macOS Big Sur 11.0.1
 * :wrench: IntelliJ IDEA Ultimate 2020.3
   * Community 版でもおそらく可能 ([機能比較](https://www.jetbrains.com/idea/features/editions_comparison_matrix.html))
-* :wreanch: docker desktop 3.0.1
+* :wrench: docker desktop 3.0.1
 * Kotlin 1.4.20
   * [IntelliJ IDEA](https://plugins.jetbrains.com/plugin/6954-kotlin) および [Gradle](https://kotlinlang.org/docs/reference/using-gradle.html) が自動的に環境構築してくれるため、手動でのインストールは不要
 
@@ -198,7 +198,7 @@ $ docker exec -it $(docker ps | grep 'gradle-on-amazonlinux' | awk '{print $1}')
 [  PASSED  ] 2 tests.
 ```
 
-![gradle-test.png](gradle-test.png)
+![gradle-test.png](https://qiita-image-store.s3.ap-northeast-1.amazonaws.com/0/13008/4b86214a-80e8-9674-5cb3-f6b48793523c.png)
 
 ### 4. [ktor client][ktor-client] の導入
 Kotlin/Native に対応している Web フレームワークとして [Ktor][ktor] があります。
@@ -328,9 +328,9 @@ You can now browse to the above endpoints to invoke your functions. You do not n
 実行ログに `Hello, SAM Local!` が出力されていれば、動作確認 OK です。
 
 ### 6. [AWS Lambda カスタムランタイム][AWS Lambda custom runtime] の実装
-ようやく本記事の本題です。
+ようやく本題です。
 
-主に下記の2つのページを参考にしながら進めていきます。
+下記の2つのページを参考にしながら進めていきます。
 
 * [AWS Lambda ランタイム API](https://docs.aws.amazon.com/ja_jp/lambda/latest/dg/runtimes-api.html)
 * [チュートリアル – カスタムランタイムの公開](https://docs.aws.amazon.com/ja_jp/lambda/latest/dg/runtimes-walkthrough.html)
@@ -363,16 +363,168 @@ kotlin {
 }
 ```
 
+#### カスタムランタイムの仕様
+カスタムランタイムは下記の仕様に則り実装する必要があります。
+
+* 無限ループで、 Lambda が呼ばれた際のコンテキストを取得 (GET) し続ける
+  * [次の呼び出し API `/runtime/invocation/next`](https://docs.aws.amazon.com/ja_jp/lambda/latest/dg/runtimes-api.html#runtimes-api-next)
+  * 実際に Lambda が呼ばれた際に、コンテキストを取得できる
+* 受け取ったコンテキストに対し処理した結果を返却 (POST) する
+  * [呼び出しレスポンス API `/runtime/invocation/AwsRequestId/response`](https://docs.aws.amazon.com/ja_jp/lambda/latest/dg/runtimes-api.html#runtimes-api-response)
+* 関数の処理の続行が不可能 (例外発生等) になった場合、その旨を返却 (POST) する
+  * [呼び出しエラー API `/runtime/invocation/AwsRequestId/error`](https://docs.aws.amazon.com/ja_jp/lambda/latest/dg/runtimes-api.html#runtimes-api-invokeerror)
+* 初期化に失敗した場合、その旨を返却 (POST) する
+  * [初期化エラー API `/runtime/init/error`](https://docs.aws.amazon.com/ja_jp/lambda/latest/dg/runtimes-api.html#runtimes-api-invokeerror)
+
+#### カスタムランタイムの実装
+前述の仕様に則り実装します。
+具体的なコードは [こちら](https://github.com/lasta/study-faas-kotlin-3/blob/main/src/nativeMain/kotlin/me/lasta/studyfaaskotlin3/lambdaruntime/LambdaCustomRuntime.kt) を参照してください。
+
+
+##### カスタムランタイム全体
+```kotlin:src/nativeMain/kotlin/me/lasta/studyfaaskotlin3/lambdaruntime/LambdaCustomRuntime.kt
+suspend inline fun <reified T> exec(block: (LambdaCustomRuntimeEnv) -> T) {
+    lateinit var lambdaEnv: LambdaCustomRuntimeEnv
+    try {
+        while (true) { /* (1) */
+            lambdaEnv = initialize() /* (2) */
+
+            val response = try {
+                block(lambdaEnv) /* (3) */
+            } catch (e: Exception) {
+                e.printStackTrace()
+                sendInvocationError(lambdaEnv, e) /* (4) */
+                null
+            } ?: continue
+
+            sendResponse(lambdaEnv, response) /* (5) */
+        }
+    } catch (e: Exception) {
+        e.printStackTrace()
+        sendInitializeError(lambdaEnv, e) /* (6) */
+    }
+}
+```
+
+引数に関数 `block` を受け取ります。
+AWS Lambda で実装すべき関数そのものです。
+最終的にシリアライズする際に具体的な型を保持し続ける必要があるため、 `reified` で型パラメータ `T` の型情報を維持します。
+
+(1) 新しい呼び出しを待ち続けるため、無限ループで待ち続ける
+(2) 「次の呼び出し API」 を呼ぶ
+(3) 「次の呼び出し API」から受け取った情報をもとに、ビジネスロジック (`block`) を実行する
+(4) ビジネスロジックの実行に失敗 (`block` 内で例外が発生) したため、実行に失敗した旨を送出する
+(5) ビジネスロジックの実行に成功したため、返却値を送出する
+(6) 「次の呼び出し API」の呼び出しに失敗したため、その旨を送出する
+
+ここまででやるべきことを整理できたので、各 API を呼ぶ処理を実装していきます。
+
+これ以降のコードでは、記事の都合上エラーハンドリングを省略しています。
+
+##### [次の呼び出し API `/runtime/invocation/next`](https://docs.aws.amazon.com/ja_jp/lambda/latest/dg/runtimes-api.html#runtimes-api-next)
+
+```kotlin:src/nativeMain/kotlin/me/lasta/studyfaaskotlin3/lambdaruntime/LambdaCustomRuntime.kt
+suspend inline fun initialize(): LambdaCustomRuntimeEnv = httpClient.use { client ->
+    LambdaCustomRuntimeEnv(client.get("$baseUrl/invocation/next"))
+}
+```
+
+特筆すべきことはありません。
+「次の呼び出し API」を呼び、結果を `LambdaCustomRuntimeEnv` に詰めて返却するだけです。
+
+##### [呼び出しレスポンス API `/runtime/invocation/AwsRequestId/response`](https://docs.aws.amazon.com/ja_jp/lambda/latest/dg/runtimes-api.html#runtimes-api-response)
+```kotlin:src/nativeMain/kotlin/me/lasta/studyfaaskotlin3/lambdaruntime/LambdaCustomRuntime.kt
+suspend inline fun <reified T> sendResponse(
+    lambdaEnv: LambdaCustomRuntimeEnv,
+    response: T
+): HttpResponse = httpClient.use { client ->
+    client.post {
+        url("http://$lambdaRuntimeApi/2018-06-01/runtime/invocation/${lambdaEnv.requestId}/response")
+        body = TextContent(
+            Json.encodeToString(ResponseMessage(body = Json.encodeToString(response))),
+            contentType = ContentType.Application.Json
+        )
+    }
+}
+```
+
+結果を body に詰めて返却します。
+
+##### [呼び出しエラー API `/runtime/invocation/AwsRequestId/error`](https://docs.aws.amazon.com/ja_jp/lambda/latest/dg/runtimes-api.html#runtimes-api-invokeerror)
+```kotlin:src/nativeMain/kotlin/me/lasta/studyfaaskotlin3/lambdaruntime/LambdaCustomRuntime.kt
+suspend inline fun sendInvocationError(
+    lambdaEnv: LambdaCustomRuntimeEnv,
+    error: Exception
+): HttpResponse = httpClient.use { client ->
+    client.post {
+        url("http://$lambdaRuntimeApi/2018-06-01/runtime/invocation/${lambdaEnv.requestId}/error")
+        body = TextContent(
+            Json.encodeToString(
+                mapOf(
+                    "errorMessage" to error.toString(),
+                    "errorType" to "InvocationError"
+                )
+            ),
+            contentType = ContentType.Application.Json
+        )
+    }
+}
+```
+
+下記のフォーマットで POST します。
+
+```json
+{
+  "errorMessage": "エラーメッセージ",
+  "errorType": "エラー種別"
+}
+```
+
+##### [初期化エラー API `/runtime/init/error`](https://docs.aws.amazon.com/ja_jp/lambda/latest/dg/runtimes-api.html#runtimes-api-invokeerror)
+```kotlin:src/nativeMain/kotlin/me/lasta/studyfaaskotlin3/lambdaruntime/LambdaCustomRuntime.kt
+@KtorExperimentalAPI
+suspend inline fun sendInitializeError(
+    lambdaEnv: LambdaCustomRuntimeEnv,
+    error: Exception
+): HttpResponse = httpClient.use { client ->
+    client.post {
+        url("http://$lambdaRuntimeApi/2018-06-01/runtime/init/error")
+        body = TextContent(
+            Json.encodeToString(
+                mapOf(
+                    "errorMessage" to error.toString(),
+                    "errorType" to "InvocationError"
+                )
+            ),
+            contentType = ContentType.Application.Json
+        )
+    }
+}
+```
+
+呼び出しエラーとパスが異なること以外は同じです。
+
+下記のフォーマットで POST します。
+
+```json
+{
+  "errorMessage": "エラーメッセージ",
+  "errorType": "エラー種別"
+}
+```
+
+これでカスタムランタイムの実装の最低限の実装は完了です。
+エラー発生時に Sentry や CloudWatch 等へ通知したり、「次の呼び出し API」から受け取った値をより扱いやすくパースしたりしていくことで、より堅牢なシステムになります。
+
+### 7. 関数本体の実装
 サンプル API として、外部 API から取得したレスポンスを詰め直して返却する API を作成していきます。
 外部 API は [JSONPlaceholder](https://jsonplaceholder.typicode.com/) をお借りします。
 
 ```kotlin:src/nativeMain/kotlin/me/lasta/studyfaaskotlin3/entrypoint/main.kt
-@KtorExperimentalAPI
 fun main() {
     runBlocking {
         LambdaCustomRuntime().exec(fetchUserArticle)
     }
-    sentry.close()
 }
 
 val fetchUserArticle: (LambdaCustomRuntimeEnv) -> UserArticle = { _ ->
@@ -401,33 +553,60 @@ data class UserArticle(
 )
 ```
 
-`LambdaCustomRuntime` や `LambdaCustomRuntimeEnv` はこれから作成します。
-
-#### カスタムランタイムの仕様
-カスタムランタイムは下記の仕様に則り実装する必要があります。
-
-* 無限ループで、 Lambda が呼ばれた際のコンテキストを取得 (GET) し続ける
-  * [次の呼び出し API `/runtime/invocation/next`](https://docs.aws.amazon.com/ja_jp/lambda/latest/dg/runtimes-api.html#runtimes-api-next)
-  * 実際に Lambda が呼ばれた際に、コンテキストを取得できる
-* 受け取ったコンテキストに対し処理した結果を返却 (POST) する
-  * [呼び出しレスポンス API `/runtime/invocation/AwsRequestId/response`](https://docs.aws.amazon.com/ja_jp/lambda/latest/dg/runtimes-api.html#runtimes-api-response)
-* 関数の処理の続行が不可能 (例外発生等) になった場合、その旨を返却 (POST) する
-  * [呼び出しエラー API `/runtime/invocation/AwsRequestId/error`](https://docs.aws.amazon.com/ja_jp/lambda/latest/dg/runtimes-api.html#runtimes-api-invokeerror)
-* 初期化に失敗した場合、その旨を返却 (POST) する
-  * [初期化エラー API `/runtime/init/error`](https://docs.aws.amazon.com/ja_jp/lambda/latest/dg/runtimes-api.html#runtimes-api-invokeerror)
-
-#### カスタムランタイムの実装
-前述の仕様に則り実装します。
-
-
-### 7. 関数本体の実装
-
 ## 動作確認
+いよいよ動作確認を行います。
 
-## 今後
+まずはビルドします。
 
-## 参考文献
+```console
+docker exec -it $(docker ps | grep 'gradle-on-amazonlinux' | awk '{print $1}') /root/work/gradlew -p /root/work/ clean build
+```
 
+ビルド結果の `bootstrap.kexe` を適切なパスに配置します。
+
+```console
+cp build/bin/native/bootstrapReleaseExecutable/bootstrap.kexe sam/bootstrap
+```
+
+なお、生成される実行可能ファイル名にて拡張子 `kexe` をつけない設定は存在しません。 ([GitHub issue](https://github.com/JetBrains/kotlin-native/issues/967), [YouTrack](https://youtrack.jetbrains.com/issue/KT-25384))
+そのため、 Makefile 等を作成することをおすすめします。
+
+続いて、ローカルで実行します。
+
+```console
+$ sam local start-api -t sam/template.yaml
+```
+
+最後に、 API へリクエストします。
+
+```console
+$ curl -s 'http://localhost:3000/
+{"userId":1,"id":1,"title":"sunt aut facere repellat provident occaecati excepturi optio reprehenderit","body":"quia et suscipit\nsuscipit recusandae consequuntur expedita et cum\nreprehenderit molestiae ut ut quas totam\nnostrum rerum est autem sunt rem eveniet architecto"}
+```
+
+無事実行できました。
+
+## 今後の展望
+今回作成したカスタムランタイムはプロトタイプです。
+プロダクトとして利用するためには、少なくとも下記の対応が必要と考えられます。
+
+* 内部エラーが発生した際に適切にハンドリングする
+  * [Sentry][sentry] へ通知等
+* 複数の API を作成する場合、エントリポイントを自動的に検知しバイナリを生成する
+  * [`buildSrc`][create buildSrc] で特定のパッケージ配下の `main` 関数を探す等
+  * [複数バイナリを一度に生成する例][example to build at once]
+* 「次の呼び出し API」のレスポンスを使いやすくパースする
+* ランタイムをライブラリ (`klib`) 化し、ポータビリティ性を高める
+* [API テスト][preacher] や CloudWatch Alarm 、単体テストなどを整備し、十分に監視・運用・テストができるようにする
+
+## おわりに
+Kotlin/Native を AWS Lambda 上で動かすことができました。
+[Kotless][Kotless] が Native 対応するまでの間は有用となる情報であると考えています。
+一方で、 Kotlin/Native のビルドが他の言語 (Go 言語等) と比較すると遅いこと、Kotlin Multiplatform は Alpha 版であること、 Ktor 1.4 系はまだ開発中であることなど、本番投入は時期尚早ととられ兼ねない段階であることを理解しておかなければなりません。
+
+次回は発展編、ネイティブライブラリ (Sentry-native) を sam local 上で動かせるようにする予定です。
+
+明日は [lethe2211](https://qiita.com/lethe2211) さんです。
 
 [github-lasta]: https://github.com/lasta
 [study-faas-kotlin1]: https://qiita.com/lasta/items/9169727d89829cf007c3
@@ -444,9 +623,8 @@ data class UserArticle(
 [ktor-jp]: https://jp.ktor.work/
 [doyaaaaaken]: https://qiita.com/doyaaaaaken
 
-<!-- TODO: delete below if needless -->
-[AWSLambda]: https://aws.amazon.com/jp/lambda/
-[kotlin-event-14]: https://kotlinlang.org/lp/event-14/
-[kotlinlang]: https://kotlinlang.org/
-[jetbrains]: https://www.jetbrains.com/
+[sentry]: https://sentry.io/
+[example to build at once]: https://github.com/JetBrains/kotlin/blob/1.3.20/libraries/tools/kotlin-gradle-plugin-integration-tests/src/test/resources/testProject/new-mpp-native-binaries/kotlin-dsl/build.gradle.kts
+[create buildSrc]: https://www.itcowork.co.jp/blog/?p=5357
+[preacher]: https://github.com/ymoch/preacher
 
