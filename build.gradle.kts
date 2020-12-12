@@ -25,8 +25,8 @@ kotlin {
 
     nativeTarget.apply {
         binaries {
-            executable {
-                entryPoint = "main"
+            executable("bootstrap") {
+                entryPoint = "me.lasta.studyfaaskotlin3.entrypoint.main"
             }
         }
     }
@@ -43,7 +43,6 @@ kotlin {
                 implementation("io.ktor:ktor-client-core:$ktor_version")
                 implementation("io.ktor:ktor-client-curl:$ktor_version")
                 implementation("io.ktor:ktor-client-cio:$ktor_version")
-                implementation("io.ktor:ktor-network-tls:$ktor_version")
                 implementation("io.ktor:ktor-client-json:$ktor_version")
                 implementation("io.ktor:ktor-client-serialization:$ktor_version")
             }
